@@ -1,8 +1,17 @@
 @echo off
-chcp 65001 >nul
-echo === กำลังติดตั้งไลบรารีที่จำเป็น ===
-python -m pip install --upgrade pip
-python -m pip install -r "%~dp0requirements.txt"
+cd /d "%~dp0"
+echo === Thai Dub: installing ===
+call "%~dp0findpy.bat"
+if not defined PY ( pause & exit /b 1 )
+echo Using: %PY%
+%PY% --version
+%PY% -m pip install --upgrade pip
+%PY% -m pip install -r "%~dp0requirements.txt"
+if errorlevel 1 (
+  echo.
+  echo [ERROR] Install failed. Take a screenshot of this window and send it to Claude.
+  pause & exit /b 1
+)
 echo.
-echo === ติดตั้งเสร็จแล้ว ดับเบิลคลิก run.bat เพื่อเริ่มใช้งาน ===
+echo === DONE. Now double-click run.bat ===
 pause

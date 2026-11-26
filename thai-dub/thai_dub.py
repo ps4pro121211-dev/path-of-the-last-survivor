@@ -79,7 +79,7 @@ def load_config() -> dict:
         try:
             cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
         except Exception as e:  # noqa: BLE001
-            print(f"[!] อ่าน config.json ไม่ได้ ({e}) ใช้ค่าเริ่มต้นแทน")
+            print(f"[!] Cannot read config.json ({e}), using defaults")
     return cfg
 
 
@@ -128,7 +128,7 @@ def select_region(sct):
     canvas.create_image(0, 0, image=photo, anchor="nw")
     canvas.create_text(
         mon["width"] // 2, 40,
-        text="ลากเมาส์ครอบบริเวณที่ซับขึ้น (ครอบให้กว้างพอสำหรับซับ 2 บรรทัด)   |   Esc = ยกเลิก",
+        text="Drag a box around the SUBTITLE area (tall enough for 2 lines)   |   Esc = cancel",
         fill="yellow", font=("Tahoma", 20, "bold"),
     )
 
@@ -192,9 +192,9 @@ class OcrEngine:
                 self._winocr = winocr
                 self.read(Image.new("RGB", (64, 32), "white"))  # ทดสอบว่าใช้ได้จริง
             except Exception as e:  # noqa: BLE001
-                print(f"[!] ใช้ Windows OCR ไม่ได้: {e}")
-                print("    -> ตรวจว่าติดตั้งภาษา English ใน Windows แล้ว (ดู README)")
-                print("    -> กำลังลองใช้ Tesseract แทน...")
+                print(f"[!] Windows OCR not available: {e}")
+                print("    -> Make sure English language is installed in Windows (see README)")
+                print("    -> Trying Tesseract instead...")
                 self.engine = "tesseract"
         if self.engine == "tesseract":
             import pytesseract
@@ -264,7 +264,7 @@ class DubPipeline:
             self.pygame = pygame
             self.mixer_ok = True
         except Exception as e:  # noqa: BLE001
-            print(f"[!] เปิดระบบเสียงไม่ได้: {e}")
+            print(f"[!] Cannot open audio device: {e}")
         threading.Thread(target=self._synth_worker, daemon=True).start()
         threading.Thread(target=self._play_worker, daemon=True).start()
 
@@ -312,7 +312,7 @@ class DubPipeline:
                     return th
             except Exception as e:  # noqa: BLE001
                 if attempt == 1:
-                    print(f"[!] แปลไม่สำเร็จ: {e}")
+                    print(f"[!] Translation failed: {e}")
                 time.sleep(0.3)
         return None
 
@@ -339,11 +339,11 @@ class DubPipeline:
             th = self.translate(text)
             if not th or gen != self.generation:
                 continue
-            print(f"  EN: {text}\n  TH: {th}\n")
+            print(f"  EN: {text}")
             try:
                 audio = loop.run_until_complete(self.synth(th))
             except Exception as e:  # noqa: BLE001
-                print(f"[!] สร้างเสียงไม่สำเร็จ: {e}")
+                print(f"[!] Text-to-speech failed: {e}")
                 continue
             if audio and gen == self.generation:
                 self.audio_q.put((gen, audio))
@@ -363,7 +363,7 @@ class DubPipeline:
                 while music.get_busy() and gen == self.generation and not self.stop_event.is_set():
                     time.sleep(0.05)
             except Exception as e:  # noqa: BLE001
-                print(f"[!] เล่นเสียงไม่สำเร็จ: {e}")
+                print(f"[!] Audio playback failed: {e}")
 
 
 # ----------------------------------------------------------------------------
@@ -430,19 +430,19 @@ def main() -> None:
     set_dpi_aware()
 
     print("=" * 60)
-    print("  Thai Dub - พากย์ไทยจากซับในเกม")
+    print("  Thai Dub - Thai voice-over from game subtitles")
     print("=" * 60)
 
     sct = mss.mss()
     if args.select or not cfg.get("region"):
-        print("[i] เลือกกรอบซับ: ลากเมาส์ครอบบริเวณที่ซับขึ้นบนจอ")
+        print("[i] Select subtitle area: drag a box around the subtitles")
         region = select_region(sct)
         if not region:
-            print("[!] ไม่ได้เลือกกรอบ ปิดโปรแกรม")
+            print("[!] No area selected, exiting")
             return
         cfg["region"] = region
         save_config(cfg)
-    print(f"[i] กรอบซับ: {cfg['region']}")
+    print(f"[i] Subtitle area: {cfg['region']}")
 
     ocr = OcrEngine(cfg)
     dub = DubPipeline(cfg)
@@ -454,12 +454,12 @@ def main() -> None:
         flags["paused"] = not flags["paused"]
         if flags["paused"]:
             dub.interrupt()
-        print("[i] หยุดพากย์ชั่วคราว" if flags["paused"] else "[i] เริ่มพากย์ต่อ")
+        print("[i] PAUSED" if flags["paused"] else "[i] RESUMED")
 
     def toggle_voice():
         cfg["voice"] = VOICES[1] if cfg["voice"] == VOICES[0] else VOICES[0]
         save_config(cfg)
-        print(f"[i] เปลี่ยนเสียงเป็น: {'ผู้หญิง' if cfg['voice'] == VOICES[1] else 'ผู้ชาย'}")
+        print(f"[i] Voice: {'FEMALE' if cfg['voice'] == VOICES[1] else 'MALE'}")
 
     try:
         import keyboard
@@ -470,14 +470,14 @@ def main() -> None:
         keyboard.add_hotkey(cfg["hotkey_debug"], lambda: flags.__setitem__("debug", True))
         keyboard.add_hotkey(cfg["hotkey_quit"], lambda: flags.__setitem__("quit", True))
         print(
-            f"[i] ปุ่มลัด: {cfg['hotkey_toggle'].upper()}=หยุด/เล่นต่อ  "
-            f"{cfg['hotkey_voice'].upper()}=สลับเสียง  {cfg['hotkey_select'].upper()}=เลือกกรอบใหม่  "
-            f"{cfg['hotkey_debug'].upper()}=ภาพดีบัก  {cfg['hotkey_quit'].upper()}=ปิด"
+            f"[i] ปุ่มลัด: {cfg['hotkey_toggle'].upper()}=pause/resume  "
+            f"{cfg['hotkey_voice'].upper()}=switch voice  {cfg['hotkey_select'].upper()}=reselect area  "
+            f"{cfg['hotkey_debug'].upper()}=debug image  {cfg['hotkey_quit'].upper()}=quit"
         )
     except Exception as e:  # noqa: BLE001
-        print(f"[!] ตั้งปุ่มลัดไม่ได้ ({e}) - กด Ctrl+C ในหน้าต่างนี้เพื่อปิด")
+        print(f"[!] Hotkeys unavailable ({e}) - press Ctrl+C here to quit")
 
-    print(f"[i] เสียง: {cfg['voice']}   กำลังรอซับ...\n")
+    print(f"[i] Voice: {cfg['voice']}   Waiting for subtitles...\n")
 
     interval = float(cfg.get("scan_interval", 0.35))
     try:
@@ -491,7 +491,7 @@ def main() -> None:
                 if region:
                     cfg["region"] = region
                     save_config(cfg)
-                    print(f"[i] กรอบซับใหม่: {region}")
+                    print(f"[i] New subtitle area: {region}")
 
             if flags["paused"]:
                 time.sleep(0.2)
@@ -512,9 +512,9 @@ def main() -> None:
                 stamp = time.strftime("%H%M%S")
                 raw_img.save(DEBUG_DIR / f"{stamp}_capture.png")
                 img.save(DEBUG_DIR / f"{stamp}_processed.png")
-                print(f"[debug] บันทึกภาพไว้ที่ {DEBUG_DIR}")
-                print(f"[debug] OCR อ่านได้: {raw!r}")
-                print(f"[debug] หลังทำความสะอาด: {text!r}\n")
+                print(f"[debug] Images saved to {DEBUG_DIR}")
+                print(f"[debug] OCR raw: {raw!r}")
+                print(f"[debug] Cleaned: {text!r}\n")
 
             line = tracker.feed(text)
             if line:
@@ -525,7 +525,7 @@ def main() -> None:
         pass
     finally:
         dub.shutdown()
-        print("[i] ปิดโปรแกรมแล้ว")
+        print("[i] Bye")
 
 
 if __name__ == "__main__":

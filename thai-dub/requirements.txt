@@ -6,3 +6,4 @@ pygame>=2.5
 keyboard>=0.13
 winocr>=0.0.9 ; sys_platform == "win32"
 pytesseract>=0.3.10
+rapidfuzz>=3.0

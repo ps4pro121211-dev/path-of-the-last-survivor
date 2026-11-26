@@ -40,8 +40,12 @@ VOICES = ["th-TH-NiwatNeural", "th-TH-PremwadeeNeural"]  # ชาย, หญิ�
 DEFAULT_CONFIG = {
     # กรอบซับ [left, top, width, height] (หน่วยพิกเซลจริงของจอ) - null = ให้เลือกตอนเปิด
     "region": None,
-    # ภาษาของซับในเกม
+    # ภาษาของซับในเกม: "en" = ซับอังกฤษ (แปลสด), "th" = ซับไทยจาก MOD (ไม่ต้องแปล)
     "source_lang": "en",
+    # (โหมด th) โฟลเดอร์ MOD ซับไทย หรือไฟล์ข้อความ ใช้แก้คำที่ OCR อ่านผิดให้ตรงกับซับจริง
+    "subtitle_db": "",
+    "db_min_score": 70,       # ความเหมือนขั้นต่ำ (0-100) ถึงจะใช้ประโยคจาก MOD แทน
+    "audio_cache": True,      # เก็บไฟล์เสียงที่สร้างแล้ว ประโยคซ้ำเล่นได้ทันที
     # ตัวแปล: "auto" (Google ก่อน ถ้าโดนจำกัดใช้ Microsoft), "google", "microsoft"
     "translator": "auto",
     # "windows" = Windows OCR (ไม่ต้องติดตั้งเพิ่ม), "tesseract" = Tesseract OCR
@@ -187,6 +191,8 @@ class OcrEngine:
         self.cfg = cfg
         self.lang = cfg["source_lang"]
         self.engine = cfg.get("ocr_engine", "windows")
+        if self.lang == "th" and self.engine == "windows":
+            self.engine = "tesseract"  # Windows OCR ไม่รองรับภาษาไทย
         self.loop = asyncio.new_event_loop()
         if self.engine == "windows":
             try:
@@ -204,8 +210,16 @@ class OcrEngine:
             if path and Path(path).exists():
                 pytesseract.pytesseract.tesseract_cmd = path
             self._tess = pytesseract
-            self._tess_lang = {"en": "eng", "ja": "jpn", "zh": "chi_sim", "ko": "kor"}.get(self.lang, "eng")
-            self._tess.get_tesseract_version()  # ถ้าไม่มี Tesseract จะ error ตรงนี้
+            self._tess_lang = {"en": "eng", "th": "tha", "ja": "jpn", "zh": "chi_sim", "ko": "kor"}.get(self.lang, "eng")
+            try:
+                self._tess.get_tesseract_version()
+            except Exception:
+                print("[!] Tesseract OCR is not installed (needed for Thai). See README section 6.")
+                raise SystemExit(1)
+            if self._tess_lang not in self._tess.get_languages(config=""):
+                print(f"[!] Tesseract has no '{self._tess_lang}' language data.")
+                print("    Reinstall Tesseract and tick 'Thai' under Additional language data.")
+                raise SystemExit(1)
         print(f"[i] OCR: {self.engine}")
 
     def read(self, img: Image.Image) -> str:
@@ -221,7 +235,26 @@ class OcrEngine:
 _SPEAKER_RE = re.compile(r"^\s*[A-Z][A-Za-z.'\- ]{1,24}:\s+")
 
 
+THAI = "\u0e00-\u0e7f"
+_THAI_SPACE_RE = re.compile(f"(?<=[{THAI}]) +(?=[{THAI}])")
+
+
+def clean_thai(raw: str, cfg: dict) -> str:
+    t = re.sub(r"\s+", " ", raw.replace("\n", " "))
+    t = re.sub(r"[|_~`^<>{}\[\]\\]", " ", t)
+    t = _THAI_SPACE_RE.sub("", t)  # Tesseract มักเว้นวรรคกลางคำไทย
+    t = re.sub(r"\s+", " ", t).strip()
+    thai = len(re.findall(f"[{THAI}]", t))
+    if thai < max(3, int(cfg.get("min_chars", 4))):
+        return ""
+    if thai < len(t.replace(" ", "")) * 0.6:
+        return ""
+    return t
+
+
 def clean_text(raw: str, cfg: dict) -> str:
+    if cfg.get("source_lang") == "th":
+        return clean_thai(raw, cfg)
     t = raw.replace("\n", " ")
     t = re.sub(r"[|_~`^<>{}\[\]\\]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
@@ -248,6 +281,60 @@ def similar(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+# ----------------------------------------------------------------------------
+# Subtitle database: ดึงประโยคไทยทั้งหมดจากไฟล์ MOD เพื่อแก้คำที่ OCR อ่านผิด
+# ----------------------------------------------------------------------------
+_TAG_RE = re.compile(r"~[A-Za-z0-9_]*~|<[^>]{0,40}>|\{[^}]{0,40}\}")
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^0-9A-Za-z\u0e00-\u0e7f]", "", s).lower()
+
+
+class SubtitleDB:
+    EXTS = {".gxt2", ".txt", ".csv", ".json", ".xml", ".ini", ".strtbl", ".lang", ".dat"}
+
+    def __init__(self, path: str, min_score: int):
+        self.lines: list[str] = []
+        self.keys: list[str] = []
+        self.min_score = min_score
+        p = Path(path)
+        files = [p] if p.is_file() else [f for f in p.rglob("*") if f.is_file() and f.suffix.lower() in self.EXTS]
+        seen = set()
+        for f in files:
+            if f.stat().st_size > 200 * 1024 * 1024:
+                continue
+            data = f.read_bytes()
+            # ใช้ได้ทั้งไฟล์ข้อความและไฟล์ไบนารี (.gxt2): แยกสตริง UTF-8 ที่มีอักษรไทย
+            for chunk in re.split(rb"[\x00\r\n\t]+", data):
+                if len(chunk) < 6:
+                    continue
+                txt = chunk.decode("utf-8", errors="replace")
+                # ตัดเศษไบนารี: เลือกช่วงที่มีอักษรไทยมากที่สุด
+                parts = re.split("[\x00-\x1f\x7f\ufffd]+", txt)
+                txt = max(parts, key=lambda x: len(re.findall(f"[{THAI}]", x)))
+                if not re.search(f"[{THAI}]", txt):
+                    continue
+                txt = re.sub(r"^[!-}]{1,4}(?=~)", "", txt)  # เศษไบนารีที่ติดหน้า ~z~
+                txt = re.sub(r"\s+", " ", _TAG_RE.sub(" ", txt)).strip(" \"',;")
+                key = _norm(txt)
+                if len(key) >= 3 and key not in seen:
+                    seen.add(key)
+                    self.lines.append(txt)
+                    self.keys.append(key)
+        print(f"[i] Subtitle DB: {len(self.lines):,} Thai lines from {len(files):,} files")
+
+    def match(self, ocr_text: str) -> tuple[str, float] | None:
+        if not self.keys:
+            return None
+        from rapidfuzz import fuzz, process
+
+        r = process.extractOne(_norm(ocr_text), self.keys, scorer=fuzz.ratio, score_cutoff=self.min_score)
+        if r:
+            return self.lines[r[2]], r[1]
+        return None
 
 
 # ----------------------------------------------------------------------------
@@ -342,7 +429,8 @@ class Translator:
 class DubPipeline:
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.translator = Translator(cfg)
+        self.translator = Translator(cfg) if cfg["source_lang"] != "th" else None
+        self.cache_dir = BASE_DIR / "audio_cache"
         self.text_q: queue.Queue = queue.Queue()
         self.audio_q: queue.Queue = queue.Queue()
         self.generation = 0  # เพิ่มทุกครั้งที่สั่งตัดเสียง เพื่อทิ้งงานเก่า
@@ -404,6 +492,21 @@ class DubPipeline:
                 buf.extend(chunk["data"])
         return bytes(buf)
 
+    def cached_synth(self, loop, text: str) -> bytes:
+        if not self.cfg.get("audio_cache", True):
+            return loop.run_until_complete(self.synth(text))
+        import hashlib
+
+        key = hashlib.sha1(f"{self.cfg['voice']}|{self.cfg.get('rate')}|{text}".encode()).hexdigest()
+        f = self.cache_dir / f"{key}.mp3"
+        if f.exists():
+            return f.read_bytes()
+        audio = loop.run_until_complete(self.synth(text))
+        if audio:
+            self.cache_dir.mkdir(exist_ok=True)
+            f.write_bytes(audio)
+        return audio
+
     # --- workers ---
     def _synth_worker(self) -> None:
         loop = asyncio.new_event_loop()
@@ -412,11 +515,11 @@ class DubPipeline:
             if item is None:
                 break
             gen, text = item
-            th = self.translator.translate(text)
+            th = self.translator.translate(text) if self.translator else text
             if not th or gen != self.generation:
                 continue
             try:
-                audio = loop.run_until_complete(self.synth(th))
+                audio = self.cached_synth(loop, th)
             except Exception as e:  # noqa: BLE001
                 print(f"[!] Text-to-speech failed: {e}")
                 continue
@@ -493,11 +596,16 @@ def main() -> None:
     ap.add_argument("--select", action="store_true", help="เลือกกรอบซับใหม่ตอนเปิด")
     ap.add_argument("--female", action="store_true", help="ใช้เสียงผู้หญิง")
     ap.add_argument("--male", action="store_true", help="ใช้เสียงผู้ชาย")
+    ap.add_argument("--thai", action="store_true", help="โหมดซับไทย (ใช้กับ MOD แปลไทย)")
+    ap.add_argument("--english", action="store_true", help="โหมดซับอังกฤษ (แปลสด)")
     args = ap.parse_args()
 
     import mss
 
     cfg = load_config()
+    if args.thai or args.english:
+        cfg["source_lang"] = "th" if args.thai else "en"
+        save_config(cfg)
     if args.female:
         cfg["voice"] = VOICES[1]
     if args.male:
@@ -520,6 +628,12 @@ def main() -> None:
     print(f"[i] Subtitle area: {cfg['region']}")
 
     ocr = OcrEngine(cfg)
+    db = None
+    if cfg["source_lang"] == "th" and cfg.get("subtitle_db"):
+        if Path(cfg["subtitle_db"]).exists():
+            db = SubtitleDB(cfg["subtitle_db"], int(cfg.get("db_min_score", 70)))
+        else:
+            print(f"[!] subtitle_db not found: {cfg['subtitle_db']}")
     dub = DubPipeline(cfg)
     tracker = SubtitleTracker(cfg)
 
@@ -593,7 +707,15 @@ def main() -> None:
 
             line = tracker.feed(text)
             if line:
-                print(f"  EN: {line}")
+                if cfg["source_lang"] == "th":
+                    m = db.match(line) if db else None
+                    if m:
+                        line = m[0]
+                        print(f"  TH [MOD {m[1]:.0f}%]: ...{len(line)} chars")
+                    else:
+                        print(f"  TH [OCR]: ...{len(line)} chars")
+                else:
+                    print(f"  EN: {line}")
                 dub.submit(line)
 
             time.sleep(max(0.0, interval - (time.monotonic() - t0)))

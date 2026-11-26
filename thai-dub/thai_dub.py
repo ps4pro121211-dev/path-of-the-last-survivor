@@ -42,6 +42,8 @@ DEFAULT_CONFIG = {
     "region": None,
     # ภาษาของซับในเกม
     "source_lang": "en",
+    # ตัวแปล: "auto" (Google ก่อน ถ้าโดนจำกัดใช้ Microsoft), "google", "microsoft"
+    "translator": "auto",
     # "windows" = Windows OCR (ไม่ต้องติดตั้งเพิ่ม), "tesseract" = Tesseract OCR
     "ocr_engine": "windows",
     "tesseract_path": r"C:\Program Files\Tesseract-OCR\tesseract.exe",
@@ -231,8 +233,14 @@ def clean_text(raw: str, cfg: dict) -> str:
     letters = sum(c.isalpha() for c in t)
     if letters < len(t.replace(" ", "")) * 0.6:
         return ""
-    if not re.search(r"[A-Za-z]{2,}", t) and cfg.get("source_lang") == "en":
-        return ""
+    if cfg.get("source_lang") == "en":
+        # ต้องมีคำภาษาอังกฤษจริง ๆ อย่างน้อย 1 คำ (3 ตัวอักษรขึ้นไป)
+        if not re.search(r"[A-Za-z]{3,}", t):
+            return ""
+        words = t.split()
+        good = sum(1 for w in words if re.fullmatch(r"[A-Za-z'’\-]+[.,!?;:\"]*", w))
+        if good < max(1, len(words) * 0.7):
+            return ""
     return t
 
 
@@ -243,15 +251,98 @@ def similar(a: str, b: str) -> float:
 
 
 # ----------------------------------------------------------------------------
+# Translator: Google (ฟรี) -> ถ้าโดนจำกัดจะสลับไป Microsoft (ฟรี) อัตโนมัติ
+# ----------------------------------------------------------------------------
+class RateLimited(Exception):
+    pass
+
+
+class Translator:
+    MIN_GAP = 0.6  # วินาที ระหว่างคำขอแต่ละครั้ง กันโดนบล็อก
+
+    def __init__(self, cfg: dict):
+        import requests
+
+        self.src = cfg["source_lang"]
+        self.order = {
+            "google": ["google", "microsoft"],
+            "microsoft": ["microsoft", "google"],
+        }.get(cfg.get("translator", "auto"), ["google", "microsoft"])
+        self.http = requests.Session()
+        self.http.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        self.cache: dict[str, str] = {}
+        self.blocked_until = {"google": 0.0, "microsoft": 0.0}
+        self.last_call = 0.0
+        self.ms_token = ""
+        self.ms_token_time = 0.0
+        self.last_error_print = 0.0
+
+    def _google(self, text: str) -> str:
+        r = self.http.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": self.src, "tl": "th", "dt": "t", "q": text},
+            timeout=6,
+        )
+        if r.status_code == 429:
+            raise RateLimited("Google 429")
+        r.raise_for_status()
+        data = r.json()
+        return "".join(seg[0] for seg in data[0] if seg and seg[0])
+
+    def _microsoft(self, text: str) -> str:
+        if not self.ms_token or time.time() - self.ms_token_time > 480:
+            t = self.http.get("https://edge.microsoft.com/translate/auth", timeout=6)
+            t.raise_for_status()
+            self.ms_token, self.ms_token_time = t.text.strip(), time.time()
+        r = self.http.post(
+            "https://api-edge.cognitive.microsofttranslator.com/translate",
+            params={"from": self.src, "to": "th", "api-version": "3.0"},
+            headers={"Authorization": f"Bearer {self.ms_token}"},
+            json=[{"Text": text}],
+            timeout=6,
+        )
+        if r.status_code == 429:
+            raise RateLimited("Microsoft 429")
+        if r.status_code == 401:
+            self.ms_token = ""
+        r.raise_for_status()
+        return r.json()[0]["translations"][0]["text"]
+
+    def translate(self, text: str) -> str | None:
+        if text in self.cache:
+            return self.cache[text]
+        wait = self.MIN_GAP - (time.monotonic() - self.last_call)
+        if wait > 0:
+            time.sleep(wait)
+        errors = []
+        for name in self.order:
+            if time.monotonic() < self.blocked_until[name]:
+                continue
+            self.last_call = time.monotonic()
+            try:
+                th = (self._google if name == "google" else self._microsoft)(text)
+                if th:
+                    self.cache[text] = th
+                    return th
+            except RateLimited:
+                self.blocked_until[name] = time.monotonic() + 60
+                print(f"[i] {name} is busy (too many requests) - switching for 60s")
+            except Exception as e:  # noqa: BLE001
+                self.blocked_until[name] = time.monotonic() + 5
+                errors.append(f"{name}: {e}")
+        if errors and time.monotonic() - self.last_error_print > 10:
+            self.last_error_print = time.monotonic()
+            print("[!] Translation failed: " + " | ".join(errors)[:300])
+        return None
+
+
+# ----------------------------------------------------------------------------
 # Translate -> TTS -> play  (ทำงานใน thread แยก เพื่อไม่ให้การอ่านจอสะดุด)
 # ----------------------------------------------------------------------------
 class DubPipeline:
     def __init__(self, cfg: dict):
-        from deep_translator import GoogleTranslator
-
         self.cfg = cfg
-        self.translator = GoogleTranslator(source=cfg["source_lang"], target="th")
-        self.cache: dict[str, str] = {}
+        self.translator = Translator(cfg)
         self.text_q: queue.Queue = queue.Queue()
         self.audio_q: queue.Queue = queue.Queue()
         self.generation = 0  # เพิ่มทุกครั้งที่สั่งตัดเสียง เพื่อทิ้งงานเก่า
@@ -301,21 +392,6 @@ class DubPipeline:
         self.text_q.put(None)
         self.audio_q.put(None)
 
-    def translate(self, text: str) -> str | None:
-        if text in self.cache:
-            return self.cache[text]
-        for attempt in range(2):
-            try:
-                th = self.translator.translate(text)
-                if th:
-                    self.cache[text] = th
-                    return th
-            except Exception as e:  # noqa: BLE001
-                if attempt == 1:
-                    print(f"[!] Translation failed: {e}")
-                time.sleep(0.3)
-        return None
-
     async def synth(self, text: str) -> bytes:
         import edge_tts
 
@@ -336,10 +412,9 @@ class DubPipeline:
             if item is None:
                 break
             gen, text = item
-            th = self.translate(text)
+            th = self.translator.translate(text)
             if not th or gen != self.generation:
                 continue
-            print(f"  EN: {text}")
             try:
                 audio = loop.run_until_complete(self.synth(th))
             except Exception as e:  # noqa: BLE001
@@ -518,6 +593,7 @@ def main() -> None:
 
             line = tracker.feed(text)
             if line:
+                print(f"  EN: {line}")
                 dub.submit(line)
 
             time.sleep(max(0.0, interval - (time.monotonic() - t0)))
